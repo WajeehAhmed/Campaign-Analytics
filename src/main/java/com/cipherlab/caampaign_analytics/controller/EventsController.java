@@ -4,34 +4,31 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import com.cipherlab.caampaign_analytics.dto.CampaignEventMessage;
 import com.cipherlab.caampaign_analytics.dto.IngestEventRequest;
-import com.cipherlab.caampaign_analytics.entity.RawEvent;
-import com.cipherlab.caampaign_analytics.repository.RawEventRepository;
+import com.cipherlab.caampaign_analytics.service.EventProducerService;
 
-import java.util.Map;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/v1/events")
 @RequiredArgsConstructor
 public class EventsController {
 
-    private final RawEventRepository rawEventRepository;
+    private final EventProducerService producerService;
 
     @PostMapping
     public ResponseEntity<?> ingestEvent(@RequestBody IngestEventRequest request) {
-        // 1. Convert DTO to Entity
-        RawEvent event = RawEvent.builder()
-                .campaignId(request.getCampaignId())
-                .eventType(request.getEventType())
-                .build();
+        CampaignEventMessage message = CampaignEventMessage.builder()
+                        .eventId(UUID.randomUUID())
+                        .campaignId(request.getCampaignId())
+                        .eventType(request.getEventType())
+                        .timestamp(java.time.Instant.now())
+                        .build();                
 
-        // 2. Save the "Raw" data (The Write-Heavy part)
-        rawEventRepository.save(event);
+        producerService.sendEvent(message);
 
         // 3. Return a quick 202 Accepted
-        return ResponseEntity.accepted().body(Map.of(
-            "status", "accepted",
-            "message", "Event recorded successfully"
-        ));
+        return ResponseEntity.accepted().body(java.util.Map.of("status", "queued"));
     }
 }
