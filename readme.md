@@ -1,75 +1,131 @@
 
-
-
-
-# campaign-analytics: High-Performance System Design (Phase 1)
-
-**campaign-analytics** is a real-time tracking engine designed to handle high-volume ad tech data. This Phase 1 implementation demonstrates a **Scalable Monolith** architecture capable of ingesting thousands of events and providing sub-100ms dashboard latency through intelligent pre-aggregation.
-
 ---
 
-## 🚀 Phase 1 Milestones
+# Campaign Analytics Engine — Phase 2: Distributed Streaming & Resilience
 
-* **High-Throughput Ingestion**: Optimized REST API (`/api/v1/events`) for recording raw "Click" and "Impression" events into an append-only store.
-* **In-Memory Aggregator**: A background worker utilizing Java Stream `Collectors` to perform Map-Reduce logic, grouping millions of raw rows into hourly summary buckets.
-* **Atomic Counter Upserts**: Implementation of PostgreSQL `ON CONFLICT` logic to ensure 100% data accuracy and prevent race conditions during concurrent updates.
-* **Persistent Watermarking**: Redis-backed state management that tracks the last processed event timestamp, making the aggregator resilient to application restarts.
-* **Read-Optimized Dashboard API**: A dedicated read-path (`/api/v1/stats`) optimized for fast time-series queries by pulling from pre-aggregated rollup tables.
+This project has been upgraded to a decoupled, high-throughput, real-time streaming analytics engine. By removing the batch aggregator from the API Gateway and implementing a distributed worker model with Apache Kafka, the system safely buffers high-volume traffic spikes, processes events concurrently without race conditions, and guarantees data integrity.
 
----
-
-## 🏗️ Architecture & Core Concepts
-
-### CQRS (Command Query Responsibility Segregation)
-The system separates the write-heavy ingestion path from the read-optimized analytics path:
-1.  **Command Path**: Raw events are saved into an append-only table (`campaign_events`).
-2.  **Aggregation Logic**: A scheduled job groups events by `CampaignID` and `HourBucket` in RAM, reducing database IO overhead.
-3.  **Query Path**: Dashboard reads hit the pre-aggregated `campaign_stats` table, avoiding massive real-time table scans.
-
-### Tech Stack
-* **Backend**: Java 21, Spring Boot 3, Spring Data JPA.
-* **Database**: PostgreSQL 15 (Relational storage & Atomic Upserts).
-* **State Store**: Redis 7 (Watermark tracking).
-* **Infrastructure**: Docker & Docker Compose.
-* **Monitoring**: Grafana (SQL-Direct visualization).
-
----
-
-## 🛠️ Getting Started
-
-### 1. Start Infrastructure
-```bash
-docker compose up -d
+## Architecture Blueprint
 
 ```
-
-### 2. Run the Application
-
-```bash
-./mvnw spring-boot:run
-
-```
-
-### 3. Ingest Sample Data
-
-```bash
-curl -X POST http://localhost:8080/api/v1/events \
-     -H "Content-Type: application/json" \
-     -d '{"campaignId": 101, "eventType": "CLICK"}'
-
-```
-
-### 4. Query Stats API
-
-```bash
-curl -X GET "http://localhost:8080/api/v1/stats/101"
+                      [ Client Traffic / Curl ]
+                                 │
+                                 ▼
+                     ┌───────────────────────┐
+                     │  caampaign-analytics  │  (Inbound Ingestion Gateway)
+                     │     (Port 8080)       │  (Returns 202 Accepted)
+                     └───────────┬───────────┘
+                                 │
+                      (Key: campaignId)
+                                 │
+                                 ▼
+                    ┌─────────────────────────┐
+                    │  Apache Kafka Cluster   │  (Elastic Backpressure Buffer)
+                    │  (campaign-events-raw)  │  (3 Partitions)
+                    └────┬───────────────┬────┘
+                         │               │
+            ┌────────────┘               └────────────┐
+            ▼                                         ▼
+┌─────────────────────────┐               ┌─────────────────────────┐
+│   campaign-processor    │               │   campaign-processor    │
+│    (Worker Instance 1)  │               │    (Worker Instance 2)  │
+├─────────────────────────┤               ├─────────────────────────┤
+│ 1. Redis SETNX Guard    │               │ 1. Redis SETNX Guard    │
+│ 2. Inline Aggregation   │               │ 2. Inline Aggregation   │
+│ 3. Atomic DB UPSERT     │               │ 3. Atomic DB UPSERT     │
+└───────────┬─────────────┘               └───────────┬─────────────┘
+            │                                         │
+            └────────────────────┬────────────────────┘
+                                 │
+                                 ▼
+                    ┌─────────────────────────┐
+                    │  PostgreSQL (Database)  │  (Atomic Read/Write Path)
+                    │    `campaign_stats`     │  (Sub-millisecond Updates)
+                    └─────────────────────────┘
 
 ```
 
 ---
 
-## 📈 Phase 2 Roadmap (Distributed Architecture)
+## Key Milestone Enhancements
 
-* **Kafka Decoupling**: Moving to an event-driven architecture to buffer ingestion spikes.
-* **Consumer Workers**: Scaling out aggregation logic across multiple worker instances.
-* **Reliability**: Implementing Dead Letter Queues (DLQ) and exponential backoff retries.
+### 1. Ingestion & Aggregation Decoupling
+
+* **The Shift:** The legacy `@Scheduled` batch-aggregator task inside `caampaign-analytics` has been deactivated.
+* **The Mechanism:** The API Gateway is now a lightweight, non-blocking pass-through. It drops incoming event payloads straight onto a Kafka broker channel and instantly returns an HTTP `202 Accepted` status back to the client.
+
+### 2. Key-Based Hashing & Concurrency Control
+
+* **The Strategy:** Kafka payloads are routed explicitly using the `campaignId` as the record key.
+* **The Mechanism:** This guarantees that all metrics associated with a single campaign dynamically route to the exact same partition and are consumed sequentially by the exact same worker thread. This eliminates distributed race conditions and row-locking resource contention in PostgreSQL.
+
+### 3. Defensive Idempotency Gates
+
+* **The Strategy:** Distributed consumer threads filter duplicate events at the caching layer before reaching disk storage.
+* **The Mechanism:** Workers execute an atomic `SETNX` (set if absent) key check (`event:processed:{eventId}`) against Redis 7 with a 24-hour TTL. If a duplicate message is transmitted over the network, it is dropped instantly at the gate.
+
+### 4. Resilient Fault Tolerance & Non-Blocking Retries
+
+* **The Strategy:** Poison pills or transient environmental bugs are caught and isolated automatically without disrupting global consumer throughput.
+* **The Mechanism:** Engineered with a custom Spring Kafka `DefaultErrorHandler` and a JSON-backed `DeadLetterPublishingRecoverer`. Failing tasks are retried locally exactly 3 times (initial delivery + 2 retries) with an explicit 2-second backoff. Permanent errors are safely dispatched to the isolated `campaign-events-raw-dlt` channel, allowing workers to commit offsets and move forward.
+
+---
+
+## Technical Specifications
+
+| Technology | Role | Configuration / Details |
+| --- | --- | --- |
+| **Spring Boot** | Framework | v4.0.6 (Running on **Java 21**) |
+| **Apache Kafka** | Event Streaming | 3 Partitions / Classic Group Protocol |
+| **Redis 7** | Idempotency Cache | Distributed Memory Layer (`StringRedisTemplate`) |
+| **PostgreSQL 15** | Relational Database | Atomic `INSERT ... ON CONFLICT DO UPDATE` (`UPSERT`) |
+
+---
+
+## Local Verification Commands
+
+### 1. Fire Inbound Test Event Surge
+
+Use this Debian bash script loop to flood the ingestion gateway with 60 parallel events across alternating campaign channels to verify backpressure cushioning:
+
+```bash
+for i in {1..60}; do
+  CAMPAIGN=$((101 + (i % 3))) 
+  UUID=$(cat /proc/sys/kernel/random/uuid)
+  
+  curl -s -X POST http://localhost:8080/api/v1/events \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"eventId\": \"$UUID\",
+      \"campaignId\": $CAMPAIGN,
+      \"eventType\": \"IMPRESSION\",
+      \"timestamp\": \"2026-05-18T12:00:00Z\"
+    }" > /dev/null
+done
+echo "🚀 Traffic spike simulated: 60 payloads written to Kafka."
+
+```
+
+### 2. Monitor Live Consumer Group Lag
+
+To inspect how Kafka safely holds backpressure while horizontal worker nodes digest records at their own stable pace, execute the native Kafka metrics descriptor utility inside your broker container:
+
+```bash
+docker exec -it caampaign-analytics-kafka-1 \
+  kafka-consumer-groups --bootstrap-server localhost:9092 \
+  --describe --group campaign-processor-group
+
+```
+
+### 3. Check Live Aggregated Results
+
+Connect to your `psql` instance and run this direct query against your data presentation table to verify that the inline `upsertStats` processor engine is incrementing campaign counters in true real-time:
+
+```sql
+SELECT campaign_id, hour_bucket, impression_count, click_count 
+FROM campaign_stats 
+ORDER BY hour_bucket DESC;
+
+```
+
+---
